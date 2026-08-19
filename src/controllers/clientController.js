@@ -109,6 +109,12 @@ const sendMessage = async (req, res) => {
       default:
         return sendErrorResponse(res, 400, 'invalid contentType')
     }
+    // Callers keep the returned id to correlate the message later on, so a success without a
+    // message would leave them dereferencing undefined. The library returns nothing when it
+    // refuses to send the content, which is a failure and has to be reported as one.
+    if (!messageOut) {
+      return sendErrorResponse(res, 500, 'whatsapp-web.js did not return the sent message')
+    }
     res.json({ success: true, message: messageOut })
   } catch (error) {
     sendErrorResponse(res, 500, error)
