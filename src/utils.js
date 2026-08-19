@@ -80,8 +80,93 @@ const exposeFunctionIfAbsent = async (page, name, fn) => {
   await page.exposeFunction(name, fn)
 }
 
+// WhatsApp Web 2.3000.x builds (rolled out since July 2026) minify the serialized id field of
+// Wid/MsgKey objects from `_serialized` to `$1`. Every `id._serialized` read then yields undefined:
+// WWebJS.sendMessage ends with `Msg.get(undefined)` and returns nothing, so `client.sendMessage()`
+// resolves to undefined and this API answers `{ success: true }` without the message payload.
+// The same rename strips ids from message/chat/contact payloads and webhooks.
+// Upstream issue: https://github.com/wwebjs/whatsapp-web.js/issues/201830
+// This restores `_serialized` inside the page and is a no-op on builds that still expose it.
+// NOTE: the callback is serialized and evaluated in the browser - it must not reference module scope.
+const patchSerializedIds = async (client) => {
+  return await client.pupPage.evaluate(() => {
+    const RENAMED_FIELD = '$1'
+
+    if (window.__wwebjsApiSerializedIds) {
+      return { applied: false, reason: 'already applied' }
+    }
+
+    let probeWid
+    try {
+      probeWid = window.require('WAWebWidFactory').createWid('0@c.us')
+    } catch (error) {
+      return { applied: false, reason: `unable to probe a wid: ${error.message}` }
+    }
+
+    if (typeof probeWid[RENAMED_FIELD] !== 'string' || typeof probeWid._serialized === 'string') {
+      return { applied: false, reason: '_serialized is exposed by this WhatsApp Web build' }
+    }
+
+    const defineSerialized = (prototype) => {
+      if (!prototype || Object.getOwnPropertyDescriptor(prototype, '_serialized')) { return false }
+      Object.defineProperty(prototype, '_serialized', {
+        configurable: true,
+        get () { return this[RENAMED_FIELD] },
+        set (value) {
+          Object.defineProperty(this, '_serialized', { value, writable: true, enumerable: true, configurable: true })
+        }
+      })
+      return true
+    }
+
+    const patchedPrototypes = []
+    if (defineSerialized(Object.getPrototypeOf(probeWid))) { patchedPrototypes.push('Wid') }
+    try {
+      if (defineSerialized(window.require('WAWebMsgKey').prototype)) { patchedPrototypes.push('MsgKey') }
+    } catch (error) {
+      // the module is gone on this build, the model getters below still cover the payloads
+    }
+
+    // Models are plain copies handed over to node, so they need the field set explicitly
+    const restoreSerialized = (value, depth) => {
+      if (!value || typeof value !== 'object' || depth > 6) { return value }
+      if (Array.isArray(value)) {
+        for (const item of value) { restoreSerialized(item, depth + 1) }
+        return value
+      }
+      if (typeof value[RENAMED_FIELD] === 'string' && typeof value._serialized !== 'string') {
+        value._serialized = value[RENAMED_FIELD]
+      }
+      for (const key of Object.keys(value)) { restoreSerialized(value[key], depth + 1) }
+      return value
+    }
+
+    const patchedModels = []
+    for (const name of ['getMessageModel', 'getChatModel', 'getContactModel']) {
+      const getModel = window.WWebJS[name]
+      if (typeof getModel !== 'function') { continue }
+      window.WWebJS[name] = function (...args) {
+        const model = getModel.apply(this, args)
+        return model instanceof Promise
+          ? model.then((resolved) => restoreSerialized(resolved, 0))
+          : restoreSerialized(model, 0)
+      }
+      patchedModels.push(name)
+    }
+
+    window.__wwebjsApiSerializedIds = true
+    return { applied: true, patchedPrototypes, patchedModels }
+  })
+}
+
 const patchWWebLibrary = async (client) => {
   // MUST be run after the 'ready' event fired
+  try {
+    logger.info(await patchSerializedIds(client), 'Serialized id patch')
+  } catch (error) {
+    logger.error({ err: error }, 'Failed to patch serialized ids')
+  }
+
   Client.prototype.getChats = async function (searchOptions = {}) {
     const chats = await this.pupPage.evaluate(async (searchOptions) => {
       return await window.WWebJS.getChats({ ...searchOptions })
@@ -164,5 +249,6 @@ module.exports = {
   decodeBase64,
   sleep,
   exposeFunctionIfAbsent,
+  patchSerializedIds,
   patchWWebLibrary
 }
