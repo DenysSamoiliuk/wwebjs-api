@@ -81,50 +81,85 @@ const exposeFunctionIfAbsent = async (page, name, fn) => {
 }
 
 // WhatsApp Web 2.3000.x builds (rolled out since July 2026) minify the serialized id field of
-// Wid/MsgKey objects from `_serialized` to `$1`. Every `id._serialized` read then yields undefined:
-// WWebJS.sendMessage ends with `Msg.get(undefined)` and returns nothing, so `client.sendMessage()`
-// resolves to undefined and this API answers `{ success: true }` without the message payload.
-// The same rename strips ids from message/chat/contact payloads and webhooks.
+// Wid/MsgKey objects away from `_serialized` - `$1` in the builds reported upstream. Every
+// `id._serialized` read then yields undefined: WWebJS.sendMessage ends with `Msg.get(undefined)`
+// and returns nothing, so `client.sendMessage()` resolves to undefined and this API answers
+// `{ success: true }` without the message. The same rename strips ids from the message, chat and
+// contact payloads and from the webhooks.
 // Upstream issue: https://github.com/wwebjs/whatsapp-web.js/issues/201830
-// This restores `_serialized` inside the page and is a no-op on builds that still expose it.
+// Wid and MsgKey are renamed independently and the alias is minifier output, so each class is
+// probed on its own and the alias is discovered by value rather than assumed to be named `$1`.
 // NOTE: the callback is serialized and evaluated in the browser - it must not reference module scope.
 const patchSerializedIds = async (client) => {
   return await client.pupPage.evaluate(() => {
-    const RENAMED_FIELD = '$1'
-
     if (window.__wwebjsApiSerializedIds) {
       return { applied: false, reason: 'already applied' }
     }
 
-    let probeWid
-    try {
-      probeWid = window.require('WAWebWidFactory').createWid('0@c.us')
-    } catch (error) {
-      return { applied: false, reason: `unable to probe a wid: ${error.message}` }
+    // The alias holds the same value `_serialized` used to hold, so the probe finds it by
+    // recognising the serialized value instead of relying on a name the minifier picked.
+    const findAlias = (probe, isSerialized) => {
+      const names = Object.keys(probe).concat(Object.getOwnPropertyNames(Object.getPrototypeOf(probe) || {}))
+      for (const name of names) {
+        if (name === '_serialized' || name === 'constructor') { continue }
+        let value
+        try { value = probe[name] } catch (error) { continue }
+        if (typeof value === 'string' && isSerialized(value)) { return name }
+      }
+      return null
     }
 
-    if (typeof probeWid[RENAMED_FIELD] !== 'string' || typeof probeWid._serialized === 'string') {
-      return { applied: false, reason: '_serialized is exposed by this WhatsApp Web build' }
-    }
-
-    const defineSerialized = (prototype) => {
-      if (!prototype || Object.getOwnPropertyDescriptor(prototype, '_serialized')) { return false }
+    const defineSerialized = (prototype, alias) => {
       Object.defineProperty(prototype, '_serialized', {
         configurable: true,
-        get () { return this[RENAMED_FIELD] },
+        get () { return this[alias] },
         set (value) {
           Object.defineProperty(this, '_serialized', { value, writable: true, enumerable: true, configurable: true })
         }
       })
-      return true
     }
 
-    const patchedPrototypes = []
-    if (defineSerialized(Object.getPrototypeOf(probeWid))) { patchedPrototypes.push('Wid') }
-    try {
-      if (defineSerialized(window.require('WAWebMsgKey').prototype)) { patchedPrototypes.push('MsgKey') }
-    } catch (error) {
-      // the module is gone on this build, the model getters below still cover the payloads
+    // Returns what happened to one class, so a build that renamed only one of them is visible
+    const restoreClass = (buildProbe, isSerialized) => {
+      let probe
+      try {
+        probe = buildProbe()
+      } catch (error) {
+        return { patched: false, reason: `unable to probe: ${error.message}` }
+      }
+      if (typeof probe._serialized === 'string') {
+        return { patched: false, reason: 'exposes _serialized' }
+      }
+      const alias = findAlias(probe, isSerialized)
+      if (!alias) {
+        return { patched: false, reason: 'no _serialized and no alias found' }
+      }
+      const prototype = Object.getPrototypeOf(probe)
+      if (!prototype || Object.getOwnPropertyDescriptor(prototype, '_serialized')) {
+        return { patched: false, reason: 'prototype is not patchable' }
+      }
+      defineSerialized(prototype, alias)
+      return { patched: true, alias }
+    }
+
+    const createWid = (jid) => window.require('WAWebWidFactory').createWid(jid)
+    const wid = restoreClass(
+      () => createWid('0@c.us'),
+      (value) => value === '0@c.us'
+    )
+    // The probe id is also the value of the key's own `id` field, so the serialized one is the
+    // field that carries the id inside a longer string
+    const msgKey = restoreClass(
+      () => {
+        const MsgKey = window.require('WAWebMsgKey')
+        return new MsgKey({ from: createWid('0@c.us'), to: createWid('0@c.us'), id: 'WWEBJSAPIPROBE', selfDir: 'out' })
+      },
+      (value) => value.includes('WWEBJSAPIPROBE') && value.length > 'WWEBJSAPIPROBE'.length
+    )
+
+    const aliases = [wid.alias, msgKey.alias].filter(Boolean)
+    if (!aliases.length) {
+      return { applied: false, reason: 'nothing to restore', wid, msgKey }
     }
 
     // Models are plain copies handed over to node, so they need the field set explicitly
@@ -134,14 +169,19 @@ const patchSerializedIds = async (client) => {
         for (const item of value) { restoreSerialized(item, depth + 1) }
         return value
       }
-      if (typeof value[RENAMED_FIELD] === 'string' && typeof value._serialized !== 'string') {
-        value._serialized = value[RENAMED_FIELD]
+      if (typeof value._serialized !== 'string') {
+        for (const alias of aliases) {
+          if (typeof value[alias] === 'string') {
+            value._serialized = value[alias]
+            break
+          }
+        }
       }
       for (const key of Object.keys(value)) { restoreSerialized(value[key], depth + 1) }
       return value
     }
 
-    const patchedModels = []
+    const models = []
     for (const name of ['getMessageModel', 'getChatModel', 'getContactModel']) {
       const getModel = window.WWebJS[name]
       if (typeof getModel !== 'function') { continue }
@@ -151,12 +191,56 @@ const patchSerializedIds = async (client) => {
           ? model.then((resolved) => restoreSerialized(resolved, 0))
           : restoreSerialized(model, 0)
       }
-      patchedModels.push(name)
+      models.push(name)
     }
 
     window.__wwebjsApiSerializedIds = true
-    return { applied: true, patchedPrototypes, patchedModels }
+    return { applied: true, wid, msgKey, models }
   })
+}
+
+// Called when the library sends a message but hands nothing back. Reports what the page looks
+// like at that moment so the failure can be told apart from a plain rename: whether a fresh
+// MsgKey exposes `_serialized`, and how the keys of the messages already in the chat are shaped.
+const logMissingMessage = async (client, chatId) => {
+  try {
+    const snapshot = await client.pupPage.evaluate(async (chatId) => {
+      const probe = (() => {
+        try {
+          const MsgKey = window.require('WAWebMsgKey')
+          const wid = window.require('WAWebWidFactory').createWid('0@c.us')
+          const key = new MsgKey({ from: wid, to: wid, id: 'WWEBJSAPIPROBE', selfDir: 'out' })
+          return { serialized: key._serialized, fields: Object.keys(key) }
+        } catch (error) {
+          return { error: error.message }
+        }
+      })()
+
+      const lastOutgoing = await (async () => {
+        try {
+          const chat = await window.WWebJS.getChat(chatId, { getAsModel: false })
+          const msgs = (chat && chat.msgs && chat.msgs.getModelsArray()) || []
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            const id = msgs[i] && msgs[i].id
+            if (!id || !id.fromMe) { continue }
+            return {
+              serialized: id._serialized,
+              fields: Object.keys(id),
+              foundInCollection: !!window.require('WAWebCollections').Msg.get(id._serialized)
+            }
+          }
+          return { error: 'no outgoing message in this chat' }
+        } catch (error) {
+          return { error: error.message }
+        }
+      })()
+
+      return { waVersion: window.Debug && window.Debug.VERSION, probe, lastOutgoing }
+    }, chatId)
+    logger.warn({ chatId, ...snapshot }, 'Sent message was not returned by the library')
+  } catch (error) {
+    logger.warn({ chatId, err: error }, 'Sent message was not returned by the library')
+  }
 }
 
 const patchWWebLibrary = async (client) => {
@@ -249,6 +333,7 @@ module.exports = {
   decodeBase64,
   sleep,
   exposeFunctionIfAbsent,
+  logMissingMessage,
   patchSerializedIds,
   patchWWebLibrary
 }
