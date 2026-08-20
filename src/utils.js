@@ -4,6 +4,7 @@ const { logger } = require('./logger')
 const ChatFactory = require('whatsapp-web.js/src/factories/ChatFactory')
 const Client = require('whatsapp-web.js').Client
 const { Chat, Message } = require('whatsapp-web.js/src/structures')
+const MessageMedia = require('whatsapp-web.js/src/structures/MessageMedia')
 
 // Trigger webhook endpoint
 const triggerWebhook = (webhookURL, sessionId, dataType, data) => {
@@ -243,6 +244,105 @@ const logMissingMessage = async (client, chatId) => {
   }
 }
 
+// WhatsApp Web 2.3000.x indexes the Msg collection under a key whatsapp-web.js no longer agrees
+// on, so `Msg.get(serializedId)` misses for every message that is not already in memory. The
+// library then falls back to `Msg.getMessagesById()`, whose IndexedDB lookup rejects the id with
+// `DataError: Failed to execute 'get' on 'IDBObjectStore'`. That class is minified, so puppeteer
+// recovers nothing but its name and the whole thing reaches the API as the opaque `t: t`, which
+// is what every failing attachment download in production looks like.
+// Upstream: wwebjs/whatsapp-web.js#201830, #201828, #201833
+// Resolve the message ourselves - never reaching the IndexedDB fallback - and report what
+// actually went wrong when the media still cannot be fetched.
+const patchMediaDownload = () => {
+  Message.prototype.downloadMedia = async function () {
+    if (!this.hasMedia) { return undefined }
+
+    const result = await this.client.pupPage.evaluate(async (id) => {
+      const attempt = (read) => { try { return read() } catch (error) { return null } }
+      const { Msg } = window.require('WAWebCollections')
+
+      // The serialized form changed shape between builds (a trailing `_out`, a participant for
+      // group messages), so try what the page handed us and the classic three-part key before
+      // giving up on the index.
+      let msg = null
+      for (const key of [id._serialized, `${id.fromMe}_${id.remote}_${id.id}`]) {
+        if (!key) { continue }
+        msg = attempt(() => Msg.get(key))
+        if (msg) { break }
+      }
+      // The chat keeps its own collection, and that is the one `_getMessageById` already reads to
+      // hand this message to the caller - so it holds the message even when the global index does
+      // not. Match on the raw id, which no build has renamed.
+      // ponytail: linear scan, bounded by the messages loaded for one chat. Narrow it if a chat
+      // ever holds enough history for this to show up in a profile.
+      if (!msg) {
+        const chat = await (async () => {
+          try { return await window.WWebJS.getChat(id.remote, { getAsModel: false }) } catch (error) { return null }
+        })()
+        const msgs = (chat && chat.msgs && attempt(() => chat.msgs.getModelsArray())) || []
+        msg = msgs.find((m) => m && m.id && m.id.id === id.id) || null
+      }
+      if (!msg) { return { failed: { reason: 'message is not in the page collection' } } }
+      if (!msg.mediaData) { return { failed: { reason: 'message carries no mediaData' } } }
+      if (msg.mediaData.mediaStage === 'REUPLOADING') {
+        return { failed: { reason: 'media expired and is being reuploaded', mediaStage: msg.mediaData.mediaStage } }
+      }
+
+      const describe = (error) => ({
+        name: error && error.name,
+        message: error && error.message,
+        status: (error && error.status) || null
+      })
+
+      if (msg.mediaData.mediaStage !== 'RESOLVED') {
+        try {
+          await msg.downloadMedia({ downloadEvenIfExpensive: true, rmrReason: 1 })
+        } catch (error) {
+          return { failed: { reason: 'the page refused to resolve the media', mediaStage: msg.mediaData.mediaStage, ...describe(error) } }
+        }
+      }
+      if (msg.mediaData.mediaStage.includes('ERROR') || msg.mediaData.mediaStage === 'FETCHING') {
+        return { failed: { reason: 'media is not downloadable yet', mediaStage: msg.mediaData.mediaStage } }
+      }
+
+      try {
+        const mockQpl = { addAnnotations () { return this }, addPoint () { return this } }
+        const decrypted = await window.require('WAWebDownloadManager').downloadManager.downloadAndMaybeDecrypt({
+          directPath: msg.directPath,
+          encFilehash: msg.encFilehash,
+          filehash: msg.filehash,
+          mediaKey: msg.mediaKey,
+          mediaKeyTimestamp: msg.mediaKeyTimestamp,
+          type: msg.type,
+          signal: new AbortController().signal,
+          downloadQpl: mockQpl
+        })
+        return {
+          media: {
+            data: await window.WWebJS.arrayBufferToBase64Async(decrypted),
+            mimetype: msg.mimetype,
+            filename: msg.filename,
+            filesize: msg.size
+          }
+        }
+      } catch (error) {
+        return { failed: { reason: 'decrypting the media failed', mediaStage: msg.mediaData.mediaStage, ...describe(error) } }
+      }
+    }, this.id)
+
+    if (result.failed) {
+      const { reason, ...details } = result.failed
+      logger.warn({ messageId: this.id._serialized, ...details }, `Media download failed: ${reason}`)
+      // 404 is how the library reports media the server no longer holds - keep that answering
+      // "no media" rather than an error.
+      if (details.status === 404) { return undefined }
+      throw new Error(`media download failed: ${reason}`)
+    }
+    const { data, mimetype, filename, filesize } = result.media
+    return new MessageMedia(mimetype, data, filename, filesize)
+  }
+}
+
 const patchWWebLibrary = async (client) => {
   // MUST be run after the 'ready' event fired
   try {
@@ -250,6 +350,8 @@ const patchWWebLibrary = async (client) => {
   } catch (error) {
     logger.error({ err: error }, 'Failed to patch serialized ids')
   }
+
+  patchMediaDownload()
 
   Client.prototype.getChats = async function (searchOptions = {}) {
     const chats = await this.pupPage.evaluate(async (searchOptions) => {
@@ -335,5 +437,6 @@ module.exports = {
   exposeFunctionIfAbsent,
   logMissingMessage,
   patchSerializedIds,
+  patchMediaDownload,
   patchWWebLibrary
 }
