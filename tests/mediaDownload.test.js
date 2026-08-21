@@ -160,6 +160,24 @@ describe('patchMediaDownload', () => {
     expect(fakeWindow.message.mediaData.mediaStage).toBe('RESOLVED')
   })
 
+  it('keeps asking the page to fetch, because one dropped request never recovers', async () => {
+    // production: several media arriving at once left every one of them stuck at INIT for the
+    // whole wait, so the single up-front request had gone nowhere
+    const fakeWindow = createFakeWindow({
+      indexedKeys: ['false_120363402133099473@g.us_ACAF63_167474247016533@lid'],
+      mediaStage: 'INIT',
+      stageAfterDownload: 'INIT'
+    })
+    let asked = 0
+    fakeWindow.message.downloadMedia = async () => {
+      asked++
+      if (asked >= 3) { fakeWindow.message.mediaData.mediaStage = 'RESOLVED' }
+    }
+
+    await expect(download(fakeWindow)).resolves.toMatchObject({ data: 'BASE64DATA' })
+    expect(asked).toBe(3)
+  })
+
   it('gives up on the stage it got stuck at rather than decrypting unresolved bytes', async () => {
     // production: the stage stayed INIT and decrypting it produced
     // `InvalidMediaFileType: Unexpected mimetype application/octet-stream for media type image`

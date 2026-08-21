@@ -265,10 +265,11 @@ const patchMediaDownload = (resolveTimeoutMs = mediaResolveTimeoutMs) => {
       // group messages), so try what the page handed us and the classic three-part key before
       // giving up on the index.
       let msg = null
-      for (const key of [id._serialized, `${id.fromMe}_${id.remote}_${id.id}`]) {
+      let resolvedBy = null
+      for (const [via, key] of [['serialized', id._serialized], ['threePart', `${id.fromMe}_${id.remote}_${id.id}`]]) {
         if (!key) { continue }
         msg = attempt(() => Msg.get(key))
-        if (msg) { break }
+        if (msg) { resolvedBy = via; break }
       }
       // The chat keeps its own collection, and that is the one `_getMessageById` already reads to
       // hand this message to the caller - so it holds the message even when the global index does
@@ -281,11 +282,12 @@ const patchMediaDownload = (resolveTimeoutMs = mediaResolveTimeoutMs) => {
         })()
         const msgs = (chat && chat.msgs && attempt(() => chat.msgs.getModelsArray())) || []
         msg = msgs.find((m) => m && m.id && m.id.id === id.id) || null
+        if (msg) { resolvedBy = 'chatScan' }
       }
       if (!msg) { return { failed: { reason: 'message is not in the page collection' } } }
-      if (!msg.mediaData) { return { failed: { reason: 'message carries no mediaData' } } }
+      if (!msg.mediaData) { return { failed: { reason: 'message carries no mediaData', resolvedBy } } }
       if (msg.mediaData.mediaStage === 'REUPLOADING') {
-        return { failed: { reason: 'media expired and is being reuploaded', mediaStage: msg.mediaData.mediaStage } }
+        return { failed: { reason: 'media expired and is being reuploaded', mediaStage: msg.mediaData.mediaStage, resolvedBy } }
       }
 
       const describe = (error) => ({
@@ -294,28 +296,41 @@ const patchMediaDownload = (resolveTimeoutMs = mediaResolveTimeoutMs) => {
         status: (error && error.status) || null
       })
 
-      if (msg.mediaData.mediaStage !== 'RESOLVED') {
-        try {
-          await msg.downloadMedia({ downloadEvenIfExpensive: true, rmrReason: 1 })
-        } catch (error) {
-          return { failed: { reason: 'the page refused to resolve the media', mediaStage: msg.mediaData.mediaStage, ...describe(error) } }
-        }
-      }
-
-      // That call returns before the page has finished fetching, so a message that just arrived is
-      // still at `INIT`. Decrypting then hands WhatsApp's own validator bytes it never resolved and
-      // it rejects them - `InvalidMediaFileType: Unexpected mimetype application/octet-stream for
-      // media type image`. The very same media downloads fine seconds later, so wait for the stage
-      // to settle rather than decrypting whatever is there.
+      // `downloadMedia` returns before the page has finished fetching, and decrypting at that point
+      // hands WhatsApp's own validator bytes it never resolved - it answers `InvalidMediaFileType:
+      // Unexpected mimetype application/octet-stream for media type image`. So the stage has to
+      // reach `RESOLVED` first.
+      // Asking once is not enough: when several media arrive in one batch - the only condition that
+      // correlated with the failures in production, every one of them stuck at `INIT` for the whole
+      // wait - the request goes nowhere and the stage never moves, so passively polling can only
+      // time out. Ask again on every round instead. A single cold download resolves in well under a
+      // second, so a still-`INIT` stage means the request was dropped, not that it is slow.
+      let resolveAttempts = 0
+      let lastResolveError = null
       const deadline = Date.now() + resolveTimeoutMs
       while (msg.mediaData.mediaStage !== 'RESOLVED' && !msg.mediaData.mediaStage.includes('ERROR')) {
         if (Date.now() > deadline) {
-          return { failed: { reason: 'media did not resolve in time', mediaStage: msg.mediaData.mediaStage } }
+          return {
+            failed: {
+              reason: 'media did not resolve in time',
+              mediaStage: msg.mediaData.mediaStage,
+              resolvedBy,
+              resolveAttempts,
+              ...(lastResolveError ? describe(lastResolveError) : {})
+            }
+          }
         }
-        await new Promise((resolve) => setTimeout(resolve, 250))
+        resolveAttempts++
+        try {
+          await msg.downloadMedia({ downloadEvenIfExpensive: true, rmrReason: 1 })
+        } catch (error) {
+          lastResolveError = error
+        }
+        if (msg.mediaData.mediaStage === 'RESOLVED') { break }
+        await new Promise((resolve) => setTimeout(resolve, 500))
       }
       if (msg.mediaData.mediaStage.includes('ERROR')) {
-        return { failed: { reason: 'the page could not fetch the media', mediaStage: msg.mediaData.mediaStage } }
+        return { failed: { reason: 'the page could not fetch the media', mediaStage: msg.mediaData.mediaStage, resolvedBy, resolveAttempts } }
       }
 
       try {
@@ -339,7 +354,7 @@ const patchMediaDownload = (resolveTimeoutMs = mediaResolveTimeoutMs) => {
           }
         }
       } catch (error) {
-        return { failed: { reason: 'decrypting the media failed', mediaStage: msg.mediaData.mediaStage, ...describe(error) } }
+        return { failed: { reason: 'decrypting the media failed', mediaStage: msg.mediaData.mediaStage, resolvedBy, resolveAttempts, ...describe(error) } }
       }
     }, this.id, resolveTimeoutMs)
 
