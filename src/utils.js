@@ -1,5 +1,5 @@
 const axios = require('axios')
-const { globalApiKey, disabledCallbacks, enableWebHook } = require('./config')
+const { globalApiKey, disabledCallbacks, enableWebHook, mediaResolveTimeoutMs } = require('./config')
 const { logger } = require('./logger')
 const ChatFactory = require('whatsapp-web.js/src/factories/ChatFactory')
 const Client = require('whatsapp-web.js').Client
@@ -253,11 +253,11 @@ const logMissingMessage = async (client, chatId) => {
 // Upstream: wwebjs/whatsapp-web.js#201830, #201828, #201833
 // Resolve the message ourselves - never reaching the IndexedDB fallback - and report what
 // actually went wrong when the media still cannot be fetched.
-const patchMediaDownload = () => {
+const patchMediaDownload = (resolveTimeoutMs = mediaResolveTimeoutMs) => {
   Message.prototype.downloadMedia = async function () {
     if (!this.hasMedia) { return undefined }
 
-    const result = await this.client.pupPage.evaluate(async (id) => {
+    const result = await this.client.pupPage.evaluate(async (id, resolveTimeoutMs) => {
       const attempt = (read) => { try { return read() } catch (error) { return null } }
       const { Msg } = window.require('WAWebCollections')
 
@@ -301,8 +301,21 @@ const patchMediaDownload = () => {
           return { failed: { reason: 'the page refused to resolve the media', mediaStage: msg.mediaData.mediaStage, ...describe(error) } }
         }
       }
-      if (msg.mediaData.mediaStage.includes('ERROR') || msg.mediaData.mediaStage === 'FETCHING') {
-        return { failed: { reason: 'media is not downloadable yet', mediaStage: msg.mediaData.mediaStage } }
+
+      // That call returns before the page has finished fetching, so a message that just arrived is
+      // still at `INIT`. Decrypting then hands WhatsApp's own validator bytes it never resolved and
+      // it rejects them - `InvalidMediaFileType: Unexpected mimetype application/octet-stream for
+      // media type image`. The very same media downloads fine seconds later, so wait for the stage
+      // to settle rather than decrypting whatever is there.
+      const deadline = Date.now() + resolveTimeoutMs
+      while (msg.mediaData.mediaStage !== 'RESOLVED' && !msg.mediaData.mediaStage.includes('ERROR')) {
+        if (Date.now() > deadline) {
+          return { failed: { reason: 'media did not resolve in time', mediaStage: msg.mediaData.mediaStage } }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250))
+      }
+      if (msg.mediaData.mediaStage.includes('ERROR')) {
+        return { failed: { reason: 'the page could not fetch the media', mediaStage: msg.mediaData.mediaStage } }
       }
 
       try {
@@ -328,7 +341,7 @@ const patchMediaDownload = () => {
       } catch (error) {
         return { failed: { reason: 'decrypting the media failed', mediaStage: msg.mediaData.mediaStage, ...describe(error) } }
       }
-    }, this.id)
+    }, this.id, resolveTimeoutMs)
 
     if (result.failed) {
       const { reason, ...details } = result.failed

@@ -5,7 +5,7 @@ const { patchMediaDownload } = require('../src/utils')
 // the serialized id no longer matches, so `Msg.get()` misses and whatsapp-web.js falls through to
 // `Msg.getMessagesById()`, whose IndexedDB lookup throws a minified DataError. `indexedKeys` names
 // the keys this fake page will actually resolve - everything else behaves like the broken build.
-const createFakeWindow = ({ indexedKeys = [], models = [], mediaStage = 'RESOLVED' } = {}) => {
+const createFakeWindow = ({ indexedKeys = [], models = [], mediaStage = 'RESOLVED', stageAfterDownload = 'RESOLVED', resolveDelayMs = 0 } = {}) => {
   const calls = { get: [], getMessagesById: 0, downloadAndMaybeDecrypt: 0 }
 
   const message = {
@@ -20,7 +20,12 @@ const createFakeWindow = ({ indexedKeys = [], models = [], mediaStage = 'RESOLVE
     mimetype: 'image/jpeg',
     filename: undefined,
     size: 96945,
-    downloadMedia: async () => { message.mediaData.mediaStage = 'RESOLVED' }
+    // The real call returns before the page has finished fetching, so the stage keeps its old
+    // value for a while - that gap is what this patch exists to survive.
+    downloadMedia: async () => {
+      if (resolveDelayMs === 0) { message.mediaData.mediaStage = stageAfterDownload; return }
+      setTimeout(() => { message.mediaData.mediaStage = stageAfterDownload }, resolveDelayMs)
+    }
   }
 
   const modules = {
@@ -80,9 +85,9 @@ const createFakeClient = (fakeWindow) => ({
   }
 })
 
-const download = (fakeWindow, overrides = {}) => {
+const download = (fakeWindow, overrides = {}, resolveTimeoutMs = 10000) => {
   const client = createFakeClient(fakeWindow)
-  patchMediaDownload()
+  patchMediaDownload(resolveTimeoutMs)
   return Message.prototype.downloadMedia.call({
     hasMedia: true,
     client,
@@ -142,6 +147,41 @@ describe('patchMediaDownload', () => {
     }
 
     await expect(download(fakeWindow)).rejects.toThrow('decrypting the media failed')
+  })
+
+  it('waits for the page to finish fetching before it decrypts', async () => {
+    const fakeWindow = createFakeWindow({
+      indexedKeys: ['false_120363402133099473@g.us_ACAF63_167474247016533@lid'],
+      mediaStage: 'INIT',
+      resolveDelayMs: 300
+    })
+
+    await expect(download(fakeWindow)).resolves.toMatchObject({ data: 'BASE64DATA' })
+    expect(fakeWindow.message.mediaData.mediaStage).toBe('RESOLVED')
+  })
+
+  it('gives up on the stage it got stuck at rather than decrypting unresolved bytes', async () => {
+    // production: the stage stayed INIT and decrypting it produced
+    // `InvalidMediaFileType: Unexpected mimetype application/octet-stream for media type image`
+    const fakeWindow = createFakeWindow({
+      indexedKeys: ['false_120363402133099473@g.us_ACAF63_167474247016533@lid'],
+      mediaStage: 'INIT',
+      stageAfterDownload: 'INIT'
+    })
+
+    await expect(download(fakeWindow, {}, 300)).rejects.toThrow('media did not resolve in time')
+    expect(fakeWindow.calls.downloadAndMaybeDecrypt).toBe(0)
+  })
+
+  it('stops waiting once the page reports it cannot fetch the media', async () => {
+    const fakeWindow = createFakeWindow({
+      indexedKeys: ['false_120363402133099473@g.us_ACAF63_167474247016533@lid'],
+      mediaStage: 'INIT',
+      stageAfterDownload: 'ERROR_FILE_GONE'
+    })
+
+    await expect(download(fakeWindow)).rejects.toThrow('the page could not fetch the media')
+    expect(fakeWindow.calls.downloadAndMaybeDecrypt).toBe(0)
   })
 
   it('leaves a message without media alone', async () => {

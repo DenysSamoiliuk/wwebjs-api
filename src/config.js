@@ -8,6 +8,9 @@ const enableLocalCallbackExample = (process.env.ENABLE_LOCAL_CALLBACK_EXAMPLE ||
 const globalApiKey = process.env.API_KEY
 const baseWebhookURL = process.env.BASE_WEBHOOK_URL
 const maxAttachmentSize = parseInt(process.env.MAX_ATTACHMENT_SIZE) || 10000000
+// How long to wait for WhatsApp Web to finish fetching a message's media before giving up.
+// Media that just arrived needs a moment; decrypting before the page resolved it yields garbage.
+const mediaResolveTimeoutMs = parseInt(process.env.MEDIA_RESOLVE_TIMEOUT_MS) || 10000
 const setMessagesAsSeen = (process.env.SET_MESSAGES_AS_SEEN || '').toLowerCase() === 'true'
 const disabledCallbacks = process.env.DISABLED_CALLBACKS ? process.env.DISABLED_CALLBACKS.split('|') : []
 const enableSwaggerEndpoint = (process.env.ENABLE_SWAGGER_ENDPOINT || '').toLowerCase() === 'true'
@@ -37,6 +40,7 @@ module.exports = {
   globalApiKey,
   baseWebhookURL,
   maxAttachmentSize,
+  mediaResolveTimeoutMs,
   setMessagesAsSeen,
   disabledCallbacks,
   enableSwaggerEndpoint,
