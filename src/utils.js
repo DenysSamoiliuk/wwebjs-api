@@ -296,19 +296,36 @@ const patchMediaDownload = (resolveTimeoutMs = mediaResolveTimeoutMs) => {
         status: (error && error.status) || null
       })
 
-      // `downloadMedia` returns before the page has finished fetching, and decrypting at that point
-      // hands WhatsApp's own validator bytes it never resolved - it answers `InvalidMediaFileType:
-      // Unexpected mimetype application/octet-stream for media type image`. So the stage has to
-      // reach `RESOLVED` first.
+      // Never re-decrypt the media ourselves. `downloadManager.downloadAndMaybeDecrypt` has to be
+      // fed `directPath`/`encFilehash`/`mediaKey`, and once the page has run a media retry those
+      // live on `msg.mediaObject`, not on the message - so the stale key off `msg` decrypts to
+      // garbage and WhatsApp's own sniffer answers `InvalidMediaFileType: Unexpected mimetype
+      // application/octet-stream for media type image` (169 of 169 attachments on 2026-08-24), or
+      // `MediaDecryptionError: decryptMedia: hmac mismatch` when it gets that far.
+      // `msg.downloadMedia()` already decrypts and parks the blob in WhatsApp's own cache, so take
+      // it from there and let the page own the crypto. That is what upstream switched to in
+      // wwebjs/whatsapp-web.js#201697, which is on main but not in any release yet.
+      const readBlob = () => {
+        // the cache stores upload FormData under the same key, so only take an entry we can read
+        const cached = attempt(() => window.require('WAWebMediaInMemoryBlobCache')
+          .InMemoryMediaBlobCache.get(msg.mediaObject && msg.mediaObject.filehash))
+        if (cached && typeof cached.arrayBuffer === 'function') { return cached }
+        const mediaBlob = msg.mediaObject && msg.mediaObject.mediaBlob
+        return (mediaBlob && attempt(() => mediaBlob.forceToBlob())) || null
+      }
+
       // Asking once is not enough: when several media arrive in one batch - the only condition that
       // correlated with the failures in production, every one of them stuck at `INIT` for the whole
       // wait - the request goes nowhere and the stage never moves, so passively polling can only
       // time out. Ask again on every round instead. A single cold download resolves in well under a
       // second, so a still-`INIT` stage means the request was dropped, not that it is slow.
+      // The stage is never used to skip the call: cache eviction leaves `RESOLVED` behind with no
+      // blob to read.
       let resolveAttempts = 0
       let lastResolveError = null
+      let blob = readBlob()
       const deadline = Date.now() + resolveTimeoutMs
-      while (msg.mediaData.mediaStage !== 'RESOLVED' && !msg.mediaData.mediaStage.includes('ERROR')) {
+      while (!blob) {
         if (Date.now() > deadline) {
           return {
             failed: {
@@ -322,39 +339,37 @@ const patchMediaDownload = (resolveTimeoutMs = mediaResolveTimeoutMs) => {
         }
         resolveAttempts++
         try {
-          await msg.downloadMedia({ downloadEvenIfExpensive: true, rmrReason: 1 })
+          await msg.downloadMedia({ downloadEvenIfExpensive: true, rmrReason: 1, isUserInitiated: true })
         } catch (error) {
           lastResolveError = error
         }
-        if (msg.mediaData.mediaStage === 'RESOLVED') { break }
+        if (msg.mediaData.mediaStage.includes('ERROR')) {
+          return {
+            failed: {
+              reason: 'the page could not fetch the media',
+              mediaStage: msg.mediaData.mediaStage,
+              resolvedBy,
+              resolveAttempts,
+              ...(lastResolveError ? describe(lastResolveError) : {})
+            }
+          }
+        }
+        blob = readBlob()
+        if (blob) { break }
         await new Promise((resolve) => setTimeout(resolve, 500))
-      }
-      if (msg.mediaData.mediaStage.includes('ERROR')) {
-        return { failed: { reason: 'the page could not fetch the media', mediaStage: msg.mediaData.mediaStage, resolvedBy, resolveAttempts } }
       }
 
       try {
-        const mockQpl = { addAnnotations () { return this }, addPoint () { return this } }
-        const decrypted = await window.require('WAWebDownloadManager').downloadManager.downloadAndMaybeDecrypt({
-          directPath: msg.directPath,
-          encFilehash: msg.encFilehash,
-          filehash: msg.filehash,
-          mediaKey: msg.mediaKey,
-          mediaKeyTimestamp: msg.mediaKeyTimestamp,
-          type: msg.type,
-          signal: new AbortController().signal,
-          downloadQpl: mockQpl
-        })
         return {
           media: {
-            data: await window.WWebJS.arrayBufferToBase64Async(decrypted),
+            data: await window.WWebJS.arrayBufferToBase64Async(await blob.arrayBuffer()),
             mimetype: msg.mimetype,
             filename: msg.filename,
             filesize: msg.size
           }
         }
       } catch (error) {
-        return { failed: { reason: 'decrypting the media failed', mediaStage: msg.mediaData.mediaStage, resolvedBy, resolveAttempts, ...describe(error) } }
+        return { failed: { reason: 'reading the decrypted media failed', mediaStage: msg.mediaData.mediaStage, resolvedBy, resolveAttempts, ...describe(error) } }
       }
     }, this.id, resolveTimeoutMs)
 

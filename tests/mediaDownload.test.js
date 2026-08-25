@@ -5,26 +5,31 @@ const { patchMediaDownload } = require('../src/utils')
 // the serialized id no longer matches, so `Msg.get()` misses and whatsapp-web.js falls through to
 // `Msg.getMessagesById()`, whose IndexedDB lookup throws a minified DataError. `indexedKeys` names
 // the keys this fake page will actually resolve - everything else behaves like the broken build.
-const createFakeWindow = ({ indexedKeys = [], models = [], mediaStage = 'RESOLVED', stageAfterDownload = 'RESOLVED', resolveDelayMs = 0 } = {}) => {
-  const calls = { get: [], getMessagesById: 0, downloadAndMaybeDecrypt: 0 }
+const createFakeWindow = ({ indexedKeys = [], models = [], mediaStage = 'RESOLVED', stageAfterDownload = 'RESOLVED', resolveDelayMs = 0, cached = null } = {}) => {
+  const calls = { get: [], getMessagesById: 0, downloadManager: 0, asked: 0 }
+
+  const blob = { arrayBuffer: async () => new ArrayBuffer(8) }
 
   const message = {
     id: { fromMe: false, remote: '120363402133099473@g.us', id: 'ACAF63', participant: '167474247016533@lid' },
     mediaData: { mediaStage },
-    directPath: '/v/t62.enc',
-    encFilehash: 'enc',
-    filehash: 'plain',
-    mediaKey: 'key',
-    mediaKeyTimestamp: 1787239177,
+    // the page hangs the fetched media off `mediaObject`, not off the message - only it holds the
+    // key material a media retry refreshed
+    mediaObject: { filehash: 'plain', mediaBlob: null },
     type: 'image',
     mimetype: 'image/jpeg',
     filename: undefined,
     size: 96945,
-    // The real call returns before the page has finished fetching, so the stage keeps its old
-    // value for a while - that gap is what this patch exists to survive.
+    // The real call returns before the page has finished fetching, so neither the stage nor the
+    // blob is there yet - that gap is what this patch exists to survive.
     downloadMedia: async () => {
-      if (resolveDelayMs === 0) { message.mediaData.mediaStage = stageAfterDownload; return }
-      setTimeout(() => { message.mediaData.mediaStage = stageAfterDownload }, resolveDelayMs)
+      calls.asked++
+      const settle = () => {
+        message.mediaData.mediaStage = stageAfterDownload
+        if (stageAfterDownload === 'RESOLVED') { message.mediaObject.mediaBlob = { forceToBlob: () => blob } }
+      }
+      if (resolveDelayMs === 0) { settle(); return }
+      setTimeout(settle, resolveDelayMs)
     }
   }
 
@@ -45,18 +50,20 @@ const createFakeWindow = ({ indexedKeys = [], models = [], mediaStage = 'RESOLVE
         }
       }
     },
+    WAWebMediaInMemoryBlobCache: {
+      InMemoryMediaBlobCache: { get: (filehash) => (filehash === 'plain' ? cached : null) }
+    },
     WAWebDownloadManager: {
-      downloadManager: {
-        downloadAndMaybeDecrypt: async () => {
-          calls.downloadAndMaybeDecrypt++
-          return new ArrayBuffer(8)
-        }
+      get downloadManager () {
+        calls.downloadManager++
+        throw new Error('re-decrypting the media must never be reached')
       }
     }
   }
 
   return {
     calls,
+    blob,
     message,
     require: (name) => {
       if (!modules[name]) { throw new Error(`module ${name} is not available`) }
@@ -96,9 +103,11 @@ const download = (fakeWindow, overrides = {}, resolveTimeoutMs = 10000) => {
   })
 }
 
+const indexed = ['false_120363402133099473@g.us_ACAF63_167474247016533@lid']
+
 describe('patchMediaDownload', () => {
   it('downloads through the serialized id when the collection still indexes it', async () => {
-    const fakeWindow = createFakeWindow({ indexedKeys: ['false_120363402133099473@g.us_ACAF63_167474247016533@lid'] })
+    const fakeWindow = createFakeWindow({ indexedKeys: indexed })
 
     const media = await download(fakeWindow)
 
@@ -130,31 +139,47 @@ describe('patchMediaDownload', () => {
     await expect(download(fakeWindow)).rejects.toThrow('message is not in the page collection')
   })
 
-  it('resolves the media first when the page has not fetched it yet', async () => {
-    const fakeWindow = createFakeWindow({
-      indexedKeys: ['false_120363402133099473@g.us_ACAF63_167474247016533@lid'],
-      mediaStage: 'INIT'
-    })
+  it('takes the blob the page decrypted instead of decrypting a second time', async () => {
+    // production: re-decrypting off the message's own stale key material answered
+    // `InvalidMediaFileType: Unexpected mimetype application/octet-stream for media type image`
+    const fakeWindow = createFakeWindow({ indexedKeys: indexed })
 
     await expect(download(fakeWindow)).resolves.toMatchObject({ data: 'BASE64DATA' })
-    expect(fakeWindow.calls.downloadAndMaybeDecrypt).toBe(1)
+    expect(fakeWindow.calls.downloadManager).toBe(0)
   })
 
-  it('surfaces the real error when decrypting fails', async () => {
-    const fakeWindow = createFakeWindow({ indexedKeys: ['false_120363402133099473@g.us_ACAF63_167474247016533@lid'] })
-    fakeWindow.require('WAWebDownloadManager').downloadManager.downloadAndMaybeDecrypt = async () => {
-      throw new Error('media not on the server')
-    }
+  it('prefers WhatsApp own media cache when it holds the file', async () => {
+    const fakeWindow = createFakeWindow({ indexedKeys: indexed, cached: { arrayBuffer: async () => new ArrayBuffer(8) } })
 
-    await expect(download(fakeWindow)).rejects.toThrow('decrypting the media failed')
+    await expect(download(fakeWindow)).resolves.toMatchObject({ data: 'BASE64DATA' })
+    // the cache already had it, so the page was never asked to fetch
+    expect(fakeWindow.calls.asked).toBe(0)
   })
 
-  it('waits for the page to finish fetching before it decrypts', async () => {
-    const fakeWindow = createFakeWindow({
-      indexedKeys: ['false_120363402133099473@g.us_ACAF63_167474247016533@lid'],
-      mediaStage: 'INIT',
-      resolveDelayMs: 300
-    })
+  it('ignores a cache entry that is not readable as a blob', async () => {
+    // the same cache keys upload FormData under the filehash
+    const fakeWindow = createFakeWindow({ indexedKeys: indexed, cached: { append: () => {} } })
+
+    await expect(download(fakeWindow)).resolves.toMatchObject({ data: 'BASE64DATA' })
+    expect(fakeWindow.calls.asked).toBe(1)
+  })
+
+  it('fetches again when the stage says RESOLVED but the cache was evicted', async () => {
+    const fakeWindow = createFakeWindow({ indexedKeys: indexed, mediaStage: 'RESOLVED' })
+
+    await expect(download(fakeWindow)).resolves.toMatchObject({ data: 'BASE64DATA' })
+    expect(fakeWindow.calls.asked).toBe(1)
+  })
+
+  it('surfaces the real error when the blob cannot be read', async () => {
+    const fakeWindow = createFakeWindow({ indexedKeys: indexed })
+    fakeWindow.blob.arrayBuffer = async () => { throw new Error('detached ArrayBuffer') }
+
+    await expect(download(fakeWindow)).rejects.toThrow('reading the decrypted media failed')
+  })
+
+  it('waits for the page to finish fetching before it reads the blob', async () => {
+    const fakeWindow = createFakeWindow({ indexedKeys: indexed, mediaStage: 'INIT', resolveDelayMs: 300 })
 
     await expect(download(fakeWindow)).resolves.toMatchObject({ data: 'BASE64DATA' })
     expect(fakeWindow.message.mediaData.mediaStage).toBe('RESOLVED')
@@ -163,43 +188,30 @@ describe('patchMediaDownload', () => {
   it('keeps asking the page to fetch, because one dropped request never recovers', async () => {
     // production: several media arriving at once left every one of them stuck at INIT for the
     // whole wait, so the single up-front request had gone nowhere
-    const fakeWindow = createFakeWindow({
-      indexedKeys: ['false_120363402133099473@g.us_ACAF63_167474247016533@lid'],
-      mediaStage: 'INIT',
-      stageAfterDownload: 'INIT'
-    })
-    let asked = 0
+    const fakeWindow = createFakeWindow({ indexedKeys: indexed, mediaStage: 'INIT', stageAfterDownload: 'INIT' })
     fakeWindow.message.downloadMedia = async () => {
-      asked++
-      if (asked >= 3) { fakeWindow.message.mediaData.mediaStage = 'RESOLVED' }
+      fakeWindow.calls.asked++
+      if (fakeWindow.calls.asked >= 3) {
+        fakeWindow.message.mediaData.mediaStage = 'RESOLVED'
+        fakeWindow.message.mediaObject.mediaBlob = { forceToBlob: () => fakeWindow.blob }
+      }
     }
 
     await expect(download(fakeWindow)).resolves.toMatchObject({ data: 'BASE64DATA' })
-    expect(asked).toBe(3)
+    expect(fakeWindow.calls.asked).toBe(3)
   })
 
-  it('gives up on the stage it got stuck at rather than decrypting unresolved bytes', async () => {
-    // production: the stage stayed INIT and decrypting it produced
-    // `InvalidMediaFileType: Unexpected mimetype application/octet-stream for media type image`
-    const fakeWindow = createFakeWindow({
-      indexedKeys: ['false_120363402133099473@g.us_ACAF63_167474247016533@lid'],
-      mediaStage: 'INIT',
-      stageAfterDownload: 'INIT'
-    })
+  it('gives up on the stage it got stuck at rather than answering without media', async () => {
+    const fakeWindow = createFakeWindow({ indexedKeys: indexed, mediaStage: 'INIT', stageAfterDownload: 'INIT' })
 
     await expect(download(fakeWindow, {}, 300)).rejects.toThrow('media did not resolve in time')
-    expect(fakeWindow.calls.downloadAndMaybeDecrypt).toBe(0)
   })
 
   it('stops waiting once the page reports it cannot fetch the media', async () => {
-    const fakeWindow = createFakeWindow({
-      indexedKeys: ['false_120363402133099473@g.us_ACAF63_167474247016533@lid'],
-      mediaStage: 'INIT',
-      stageAfterDownload: 'ERROR_FILE_GONE'
-    })
+    const fakeWindow = createFakeWindow({ indexedKeys: indexed, mediaStage: 'INIT', stageAfterDownload: 'ERROR_FILE_GONE' })
 
     await expect(download(fakeWindow)).rejects.toThrow('the page could not fetch the media')
-    expect(fakeWindow.calls.downloadAndMaybeDecrypt).toBe(0)
+    expect(fakeWindow.calls.asked).toBe(1)
   })
 
   it('leaves a message without media alone', async () => {
