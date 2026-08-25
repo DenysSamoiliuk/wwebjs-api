@@ -214,6 +214,31 @@ describe('patchMediaDownload', () => {
     expect(fakeWindow.calls.asked).toBe(1)
   })
 
+  it('waits out a re-upload instead of failing on it', async () => {
+    // the media expired and the sender is uploading it again - the page is already on it
+    const fakeWindow = createFakeWindow({ indexedKeys: indexed, mediaStage: 'REUPLOADING' })
+    setTimeout(() => { fakeWindow.message.mediaObject.mediaBlob = { forceToBlob: () => fakeWindow.blob } }, 300)
+
+    await expect(download(fakeWindow)).resolves.toMatchObject({ data: 'BASE64DATA' })
+    // asking again while the page is re-uploading would only pile on
+    expect(fakeWindow.calls.asked).toBe(0)
+  })
+
+  it('survives the page dropping mediaData while it works', async () => {
+    // production 2026-08-25: `Cannot read properties of undefined (reading 'mediaStage')`
+    const fakeWindow = createFakeWindow({ indexedKeys: indexed, mediaStage: 'INIT' })
+    fakeWindow.message.downloadMedia = async () => {
+      fakeWindow.calls.asked++
+      delete fakeWindow.message.mediaData
+      if (fakeWindow.calls.asked >= 2) {
+        fakeWindow.message.mediaData = { mediaStage: 'RESOLVED' }
+        fakeWindow.message.mediaObject.mediaBlob = { forceToBlob: () => fakeWindow.blob }
+      }
+    }
+
+    await expect(download(fakeWindow)).resolves.toMatchObject({ data: 'BASE64DATA' })
+  })
+
   it('leaves a message without media alone', async () => {
     const fakeWindow = createFakeWindow()
 

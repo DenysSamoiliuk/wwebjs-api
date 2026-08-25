@@ -286,9 +286,11 @@ const patchMediaDownload = (resolveTimeoutMs = mediaResolveTimeoutMs) => {
       }
       if (!msg) { return { failed: { reason: 'message is not in the page collection' } } }
       if (!msg.mediaData) { return { failed: { reason: 'message carries no mediaData', resolvedBy } } }
-      if (msg.mediaData.mediaStage === 'REUPLOADING') {
-        return { failed: { reason: 'media expired and is being reuploaded', mediaStage: msg.mediaData.mediaStage, resolvedBy } }
-      }
+
+      // The page drops `mediaData` off the message while it is working on it - reading the stage
+      // straight through crashed one download on 2026-08-25 with `Cannot read properties of
+      // undefined (reading 'mediaStage')`. Treat it as a stage like any other and keep waiting.
+      const stageOf = () => (msg.mediaData && msg.mediaData.mediaStage) || 'GONE'
 
       const describe = (error) => ({
         name: error && error.name,
@@ -330,24 +332,28 @@ const patchMediaDownload = (resolveTimeoutMs = mediaResolveTimeoutMs) => {
           return {
             failed: {
               reason: 'media did not resolve in time',
-              mediaStage: msg.mediaData.mediaStage,
+              mediaStage: stageOf(),
               resolvedBy,
               resolveAttempts,
               ...(lastResolveError ? describe(lastResolveError) : {})
             }
           }
         }
-        resolveAttempts++
-        try {
-          await msg.downloadMedia({ downloadEvenIfExpensive: true, rmrReason: 1, isUserInitiated: true })
-        } catch (error) {
-          lastResolveError = error
+        // `REUPLOADING` means the media expired and the sender is uploading it again - the page is
+        // already on it and a second ask would only pile on, so wait that stage out instead.
+        if (stageOf() !== 'REUPLOADING') {
+          resolveAttempts++
+          try {
+            await msg.downloadMedia({ downloadEvenIfExpensive: true, rmrReason: 1, isUserInitiated: true })
+          } catch (error) {
+            lastResolveError = error
+          }
         }
-        if (msg.mediaData.mediaStage.includes('ERROR')) {
+        if (stageOf().includes('ERROR')) {
           return {
             failed: {
               reason: 'the page could not fetch the media',
-              mediaStage: msg.mediaData.mediaStage,
+              mediaStage: stageOf(),
               resolvedBy,
               resolveAttempts,
               ...(lastResolveError ? describe(lastResolveError) : {})
@@ -369,7 +375,7 @@ const patchMediaDownload = (resolveTimeoutMs = mediaResolveTimeoutMs) => {
           }
         }
       } catch (error) {
-        return { failed: { reason: 'reading the decrypted media failed', mediaStage: msg.mediaData.mediaStage, resolvedBy, resolveAttempts, ...describe(error) } }
+        return { failed: { reason: 'reading the decrypted media failed', mediaStage: stageOf(), resolvedBy, resolveAttempts, ...describe(error) } }
       }
     }, this.id, resolveTimeoutMs)
 
